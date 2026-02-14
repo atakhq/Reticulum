@@ -35,6 +35,9 @@ import threading
 import socket
 import time
 import math
+import os
+import fcntl
+import termios
 import RNS
 
 class KISS():
@@ -377,6 +380,21 @@ class RNodeInterface(Interface):
                 write_timeout = None,
                 dsrdtr = False,
             )
+
+            # TEGRA_PATCH: Configure fd for blocking termios reads, bypassing
+            # pyserial's select() wrapper. On NVIDIA Tegra xHCI (Jetson), the
+            # CDC ACM driver's poll() implementation does not properly wake
+            # waiters when new data arrives, causing select() to miss data that
+            # arrives after the call starts. Using termios VMIN/VTIME with
+            # os.read() uses the kernel's tty waitqueue instead, which works.
+            fd = self.serial.fd
+            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+            attrs = termios.tcgetattr(fd)
+            attrs[6][termios.VMIN] = 1   # Block until at least 1 byte
+            attrs[6][termios.VTIME] = 1  # 100ms timeout (deciseconds)
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            self._use_termios_read = True
         
         else:
             if self.use_ble:
@@ -441,8 +459,13 @@ class RNodeInterface(Interface):
             while not self.detected and time.time() < detect_time + ble_detect_timeout: time.sleep(0.1)
             if not self.detected: RNS.log(f"RNode detect timed out over BLE", RNS.LOG_ERROR)
         else:
-            sleep(0.2)
-        
+            # TEGRA_PATCH: nRF52840 on Tegra xHCI needs longer detect timeout.
+            # The firmware takes ~1-2s to respond after port open due to USB
+            # endpoint initialization timing on NVIDIA Jetson.
+            serial_detect_timeout = 5.0
+            detect_time = time.time()
+            while not self.detected and time.time() < detect_time + serial_detect_timeout: time.sleep(0.1)
+
         if not self.detected:
             RNS.log(f"Could not detect device for {self}", RNS.LOG_ERROR)
             self.serial.close()
@@ -468,13 +491,24 @@ class RNodeInterface(Interface):
             
 
     def initRadio(self):
+        # TEGRA_PATCH: Add delays between commands for Tegra CDC ACM.
+        # On Tegra, rapid back-to-back KISS writes can overwhelm the USB
+        # CDC bulk endpoint, causing response data to be lost.
+        _tegra_delay = 0.3 if getattr(self, '_use_termios_read', False) else 0
         self.setFrequency()
+        if _tegra_delay: sleep(_tegra_delay)
         self.setBandwidth()
+        if _tegra_delay: sleep(_tegra_delay)
         self.setTXPower()
+        if _tegra_delay: sleep(_tegra_delay)
         self.setSpreadingFactor()
+        if _tegra_delay: sleep(_tegra_delay)
         self.setCodingRate()
+        if _tegra_delay: sleep(_tegra_delay)
         self.setSTALock()
+        if _tegra_delay: sleep(_tegra_delay)
         self.setLTALock()
+        if _tegra_delay: sleep(_tegra_delay)
         self.setRadioState(KISS.RADIO_STATE_ON)
 
         if self.use_ble:
@@ -661,6 +695,7 @@ class RNodeInterface(Interface):
         RNS.log("Waiting for radio configuration validation for "+str(self)+"...", RNS.LOG_VERBOSE)
         if self.use_ble: sleep(1.00)
         elif self.use_tcp: sleep(1.5)
+        elif getattr(self, '_use_termios_read', False): sleep(5.0)  # TEGRA_PATCH: longer wait for termios reads
         else: sleep(0.25)
 
         if self.use_ble and self.ble != None and self.ble.device_disappeared:
@@ -750,8 +785,23 @@ class RNodeInterface(Interface):
             last_read_ms = int(time.time()*1000)
 
             while self.serial.is_open:
-                if self.serial.in_waiting:
-                    byte = ord(self.serial.read(1))
+                # TEGRA_PATCH: Use os.read() with termios VMIN/VTIME instead of
+                # pyserial's select()-based read. On Tegra CDC ACM, select/poll
+                # doesn't wake up when data arrives mid-wait, but the kernel's
+                # tty waitqueue (used by blocking os.read) does work correctly.
+                if getattr(self, '_use_termios_read', False):
+                    try:
+                        data = os.read(self.serial.fd, 1)
+                    except OSError:
+                        data = b""
+                else:
+                    if self.serial.in_waiting:
+                        data = self.serial.read(1)
+                    else:
+                        data = b""
+
+                if len(data) > 0:
+                    byte = data[0]
                     last_read_ms = int(time.time()*1000)
 
                     if (in_frame and byte == KISS.FEND and command == KISS.CMD_DATA):
@@ -1150,7 +1200,10 @@ class RNodeInterface(Interface):
                             if time.time() > self.tcp.last_write + self.tcp.ACTIVITY_KEEPALIVE:
                                 self.detect()
 
-                    sleep(0.08)
+                    if getattr(self, '_use_termios_read', False):
+                        pass  # TEGRA_PATCH: blocking os.read with VTIME already provides idle delay
+                    else:
+                        sleep(0.08)
 
         except Exception as e:
             self.online = False

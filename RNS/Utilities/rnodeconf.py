@@ -42,6 +42,8 @@ import time
 import math
 import hashlib
 import zipfile
+import fcntl
+import termios
 from urllib.request import urlretrieve
 from importlib import util
 import RNS
@@ -459,15 +461,29 @@ class RNode():
             data_buffer = b""
             command_buffer = b""
             last_read_ms = int(time.time()*1000)
+            use_termios = getattr(self.serial, '_use_termios_read', False)
 
             while self.serial.is_open:
-                try:
-                    data_waiting = self.serial.in_waiting
-                except Exception as e:
-                    data_waiting = False
+                if use_termios:
+                    # TEGRA_PATCH: Use os.read() with termios VMIN/VTIME
+                    # instead of pyserial's in_waiting which fails on Tegra
+                    try:
+                        data = os.read(self.serial.fd, 1)
+                    except OSError:
+                        data = b""
+                    data_waiting = len(data) > 0
+                else:
+                    try:
+                        data_waiting = self.serial.in_waiting
+                    except Exception as e:
+                        data_waiting = False
+                    data = None
 
                 if data_waiting:
-                    byte = ord(self.serial.read(1))
+                    if use_termios:
+                        byte = data[0]
+                    else:
+                        byte = ord(self.serial.read(1))
                     last_read_ms = int(time.time()*1000)
 
                     if (in_frame and byte == KISS.FEND and command == KISS.CMD_ROM_READ):
@@ -1006,18 +1022,27 @@ class RNode():
 
 
     def download_eeprom(self):
-        self.eeprom = None
-        kiss_command = bytes([KISS.FEND, KISS.CMD_ROM_READ, 0x00, KISS.FEND])
-        written = self.serial.write(kiss_command)
-        if written != len(kiss_command):
-            raise IOError("An IO error occurred while downloading EEPROM")
+        # TEGRA_PATCH: Retry EEPROM download for unreliable USB CDC
+        max_retries = 5 if getattr(self.serial, '_use_termios_read', False) else 1
+        for attempt in range(max_retries):
+            self.eeprom = None
+            kiss_command = bytes([KISS.FEND, KISS.CMD_ROM_READ, 0x00, KISS.FEND])
+            written = self.serial.write(kiss_command)
+            if written != len(kiss_command):
+                raise IOError("An IO error occurred while downloading EEPROM")
 
-        sleep(0.6)
-        if self.eeprom == None:
-            RNS.log("Could not download EEPROM from device. Is a valid firmware installed?")
-            graceful_exit()
-        else:
-            self.parse_eeprom()
+            sleep(2.0 if max_retries > 1 else 0.6)
+            if self.eeprom != None:
+                if attempt > 0:
+                    RNS.log(f"EEPROM download succeeded on attempt {attempt+1}")
+                self.parse_eeprom()
+                return
+            elif attempt < max_retries - 1:
+                RNS.log(f"EEPROM download attempt {attempt+1} failed, retrying...")
+                sleep(0.5)
+
+        RNS.log("Could not download EEPROM from device. Is a valid firmware installed?")
+        graceful_exit()
 
     def download_cfg_sector(self):
         self.cfg_sector = None
@@ -1217,14 +1242,23 @@ class RNode():
 
     def device_probe(self):
         sleep(2.5)
-        self.detect()
-        sleep(0.75)
-        if self.detected == True:
-            RNS.log("Device connected")
-            RNS.log("Current firmware version: "+self.version)
-            return True
-        else:
-            raise IOError("Got invalid response while detecting device")
+        # TEGRA_PATCH: Retry detect up to 5 times for unreliable USB CDC
+        max_retries = 5 if getattr(self.serial, '_use_termios_read', False) else 1
+        for attempt in range(max_retries):
+            self.detected = None
+            self.detect()
+            sleep(1.5 if max_retries > 1 else 0.75)
+            if self.detected == True:
+                RNS.log("Device connected" + (f" (attempt {attempt+1})" if attempt > 0 else ""))
+                if self.version:
+                    RNS.log("Current firmware version: "+self.version)
+                else:
+                    RNS.log("Firmware version not yet received, continuing...")
+                return True
+            elif attempt < max_retries - 1:
+                RNS.log(f"Detect attempt {attempt+1} failed, retrying...")
+                sleep(0.5)
+        raise IOError("Got invalid response while detecting device")
 
 selected_version = None
 selected_hash = None
@@ -1417,7 +1451,7 @@ def ensure_firmware_file(fw_filename):
 
 def rnode_open_serial(port):
     import serial
-    return serial.Serial(
+    s = serial.Serial(
         port = port,
         baudrate = rnode_baudrate,
         bytesize = 8,
@@ -1430,6 +1464,26 @@ def rnode_open_serial(port):
         write_timeout = None,
         dsrdtr = False
     )
+    # TEGRA_PATCH: Configure termios for blocking reads on Tegra xHCI
+    # The Tegra CDC ACM driver has a bug where select()/poll() on the fd
+    # never reports data ready, causing pyserial's in_waiting to always
+    # return 0. Workaround: use termios VMIN/VTIME for blocking reads
+    # via os.read() instead of pyserial's polling approach.
+    try:
+        fd = s.fd
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+        attrs = termios.tcgetattr(fd)
+        attrs[6][termios.VMIN] = 1   # Block until at least 1 byte
+        attrs[6][termios.VTIME] = 1  # 100ms timeout
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        s._use_termios_read = True
+        s.dtr = True
+        s.rts = True
+    except Exception as e:
+        s._use_termios_read = False
+        RNS.log("Termios configuration failed (non-Tegra platform): "+str(e), RNS.LOG_DEBUG)
+    return s
     
     
 def graceful_exit(C=0):
