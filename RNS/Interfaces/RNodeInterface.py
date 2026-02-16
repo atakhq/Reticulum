@@ -392,7 +392,7 @@ class RNodeInterface(Interface):
             fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
             attrs = termios.tcgetattr(fd)
             attrs[6][termios.VMIN] = 1   # Block until at least 1 byte
-            attrs[6][termios.VTIME] = 1  # 100ms timeout (deciseconds)
+            attrs[6][termios.VTIME] = 2  # TEGRA_PATCH v2: 200ms timeout (deciseconds); increased from 100ms to reduce partial-frame reads on Tegra xHCI
             termios.tcsetattr(fd, termios.TCSANOW, attrs)
             self._use_termios_read = True
         
@@ -477,24 +477,43 @@ class RNodeInterface(Interface):
             elif self.use_ble: RNS.log(f"BLE connection to {self} is now open", RNS.LOG_VERBOSE)
             else:              RNS.log(f"Serial port {self.port} is now open", RNS.LOG_VERBOSE)
             RNS.log("Configuring RNode interface...", RNS.LOG_VERBOSE)
-            self.initRadio()
-            if (self.validateRadioState()):
-                self.interface_ready = True
-                RNS.log(str(self)+" is configured and powered up")
-                sleep(0.3)
-                self.online = True
-            else:
-                RNS.log("After configuring "+str(self)+", the reported radio parameters did not match your configuration.", RNS.LOG_ERROR)
-                RNS.log("Make sure that your hardware actually supports the parameters specified in the configuration", RNS.LOG_ERROR)
-                RNS.log("Aborting RNode startup", RNS.LOG_ERROR)
-                self.serial.close()
+            # TEGRA_PATCH v2: Retry init+validate within the same port session.
+            # On Tegra xHCI, KISS command responses can be corrupted by USB
+            # bulk endpoint timing issues. Retrying without full port reopen
+            # is much faster than falling through to reconnect_port().
+            _max_init_attempts = 5 if getattr(self, '_use_termios_read', False) else 1
+            for _init_attempt in range(_max_init_attempts):
+                self.initRadio()
+                if self.validateRadioState():
+                    self.interface_ready = True
+                    RNS.log(str(self)+" is configured and powered up")
+                    sleep(0.3)
+                    self.online = True
+                    break
+                elif _init_attempt < _max_init_attempts - 1:
+                    RNS.log("Radio validation failed (attempt "+str(_init_attempt+1)+"/"+str(_max_init_attempts)+"), retrying init...", RNS.LOG_WARNING)
+                    self.serial.reset_input_buffer()
+                    self.r_frequency = None
+                    self.r_bandwidth = None
+                    self.r_txpower   = None
+                    self.r_sf        = None
+                    self.r_cr        = None
+                    self.r_state     = None
+                    self.r_lock      = None
+                    sleep(1.0)
+                else:
+                    RNS.log("After configuring "+str(self)+", the reported radio parameters did not match your configuration.", RNS.LOG_ERROR)
+                    RNS.log("Make sure that your hardware actually supports the parameters specified in the configuration", RNS.LOG_ERROR)
+                    RNS.log("Aborting RNode startup", RNS.LOG_ERROR)
+                    self.serial.close()
             
 
     def initRadio(self):
-        # TEGRA_PATCH: Add delays between commands for Tegra CDC ACM.
+        # TEGRA_PATCH v2: Add delays between commands for Tegra CDC ACM.
         # On Tegra, rapid back-to-back KISS writes can overwhelm the USB
-        # CDC bulk endpoint, causing response data to be lost.
-        _tegra_delay = 0.3 if getattr(self, '_use_termios_read', False) else 0
+        # CDC bulk endpoint, causing response data to be lost. Increased
+        # from 300ms to 500ms in v2 to further reduce response corruption.
+        _tegra_delay = 0.5 if getattr(self, '_use_termios_read', False) else 0
         self.setFrequency()
         if _tegra_delay: sleep(_tegra_delay)
         self.setBandwidth()
@@ -695,7 +714,18 @@ class RNodeInterface(Interface):
         RNS.log("Waiting for radio configuration validation for "+str(self)+"...", RNS.LOG_VERBOSE)
         if self.use_ble: sleep(1.00)
         elif self.use_tcp: sleep(1.5)
-        elif getattr(self, '_use_termios_read', False): sleep(5.0)  # TEGRA_PATCH: longer wait for termios reads
+        elif getattr(self, '_use_termios_read', False):
+            # TEGRA_PATCH v2: Poll for radio state instead of fixed 5s wait.
+            # Exit early when all values are populated, or timeout after 10s.
+            # This typically completes in 2-4s, saving time on each attempt.
+            _poll_deadline = time.time() + 10.0
+            while time.time() < _poll_deadline:
+                if (self.r_frequency is not None and self.r_bandwidth is not None
+                    and self.r_txpower is not None and self.r_sf is not None
+                    and self.r_state is not None):
+                    sleep(0.2)  # Brief extra wait for any trailing KISS frames
+                    break
+                sleep(0.2)
         else: sleep(0.25)
 
         if self.use_ble and self.ble != None and self.ble.device_disappeared:
