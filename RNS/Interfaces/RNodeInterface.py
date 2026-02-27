@@ -1256,15 +1256,35 @@ class RNodeInterface(Interface):
 
     def reconnect_port(self):
         self.reconnecting = True
+        backoff = RNodeInterface.RECONNECT_WAIT  # Start at 5s
+        max_backoff = 300  # Cap at 5 minutes
+        attempts = 0
         while not self.online and not self.detached:
             try:
-                time.sleep(5)
+                time.sleep(backoff)
+
+                # Skip open attempt if device file doesn't exist —
+                # avoids noisy pyserial exceptions for unplugged hardware
+                if not hasattr(self, "use_ble") or (not self.use_ble and not self.use_tcp):
+                    import os
+                    if not os.path.exists(self.port):
+                        attempts += 1
+                        if attempts <= 3 or attempts % 60 == 0:
+                            RNS.log(f"Device {self.port} not present, waiting (attempt {attempts}, next check in {backoff}s)", RNS.LOG_WARNING)
+                        backoff = min(backoff * 2, max_backoff)
+                        continue
+
                 RNS.log("Attempting to reconnect serial port "+str(self.port)+" for "+str(self)+"...", RNS.LOG_VERBOSE)
                 self.open_port()
                 if self.serial.is_open: self.configure_device()
-            
+
             except Exception as e:
-                RNS.log("Error while reconnecting port, the contained exception was: "+str(e), RNS.LOG_ERROR)
+                attempts += 1
+                if attempts <= 5:
+                    RNS.log("Error while reconnecting port, the contained exception was: "+str(e), RNS.LOG_ERROR)
+                elif attempts % 30 == 0:
+                    RNS.log(f"Still unable to reconnect {self.port} after {attempts} attempts: {e}", RNS.LOG_WARNING)
+                backoff = min(backoff * 2, max_backoff)
 
         self.reconnecting = False
         if self.online: RNS.log(f"Reconnected port for {self}")

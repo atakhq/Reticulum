@@ -877,7 +877,12 @@ class I2PInterface(Interface):
         self.bind_port   = self.i2p.get_free_port()
         self.address = (self.bind_ip, self.bind_port)
         self.bitrate = I2PInterface.BITRATE_GUESS
-        self.ifac_size = ifac_size
+        # Resolve ifac_size BEFORE spawning I2PInterfacePeer children,
+        # because peers copy parent_interface.ifac_size at init time.
+        # interface_post_init() sets the default too late — peers are
+        # already spawned with None, causing "bad operand type for
+        # unary -: 'NoneType'" in Transport.transmit() IFAC masking.
+        self.ifac_size = ifac_size if ifac_size != None else I2PInterface.DEFAULT_IFAC_SIZE
         self.ifac_netname = ifac_netname
         self.ifac_netkey = ifac_netkey
         self.supports_discovery = True
