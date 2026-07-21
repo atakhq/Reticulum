@@ -36,6 +36,7 @@ import socket
 import time
 import sys
 import os
+import random
 import RNS
 import asyncio
 
@@ -64,6 +65,39 @@ class KISS():
         data = data.replace(bytes([0xc0]), bytes([0xdb, 0xdc]))
         return data
 
+class I2PRetryPolicy:
+    TRANSIENT_BASE_WAIT = 15
+    TRANSIENT_MAX_WAIT = 300
+    PERMANENT_FAILURE_THRESHOLD = 3
+    CIRCUIT_BASE_WAIT = 900
+    CIRCUIT_MAX_WAIT = 3600
+    STABLE_CONNECTION_SECONDS = 300
+    JITTER_MIN = 0.90
+    JITTER_MAX = 1.10
+
+    def __init__(self, random_source=None):
+        self.failures = 0
+        self.random_source = random_source or random.uniform
+
+    def reset(self):
+        self.failures = 0
+
+    def next_delay(self, permanent=False, connected_seconds=0):
+        if connected_seconds >= self.STABLE_CONNECTION_SECONDS:
+            self.reset()
+
+        self.failures += 1
+        circuit_open = permanent and self.failures >= self.PERMANENT_FAILURE_THRESHOLD
+        if circuit_open:
+            exponent = self.failures - self.PERMANENT_FAILURE_THRESHOLD
+            delay = min(self.CIRCUIT_BASE_WAIT * (2 ** exponent), self.CIRCUIT_MAX_WAIT)
+        else:
+            exponent = self.failures - 1
+            delay = min(self.TRANSIENT_BASE_WAIT * (2 ** exponent), self.TRANSIENT_MAX_WAIT)
+
+        jittered_delay = delay * self.random_source(self.JITTER_MIN, self.JITTER_MAX)
+        return max(1, int(round(jittered_delay))), circuit_open
+
 # TODO: Neater shutdown of the event loop and
 # better error handling is needed. Sometimes
 # errors occur in I2P that leave tunnel setup
@@ -74,6 +108,8 @@ class KISS():
 # the console. This should also be remedied.
 
 class I2PController:
+    TUNNEL_CLOSE_TIMEOUT = 10
+
     def __init__(self, rns_storagepath):
         import RNS.vendor.i2plib as i2plib
         import RNS.vendor.i2plib.utils
@@ -81,6 +117,8 @@ class I2PController:
         self.client_tunnels = {}
         self.server_tunnels = {}
         self.i2plib_tunnels = {}
+        self.client_tunnel_errors = {}
+        self.client_tunnel_online_since = {}
         self.loop = None
         self.i2plib = i2plib
         self.utils = i2plib.utils
@@ -115,17 +153,28 @@ class I2PController:
 
 
     def stop(self):
-        for i2ptunnel in self.i2plib_tunnels:
-            if hasattr(i2ptunnel, "stop") and callable(i2ptunnel.stop):
-                i2ptunnel.stop()
+        tunnels = {tunnel for tunnel in self.i2plib_tunnels.values() if tunnel is not None}
+        for i2ptunnel in tunnels:
+            self.stop_tunnel(i2ptunnel)
 
-        if hasattr(asyncio.Task, "all_tasks") and callable(asyncio.Task.all_tasks):
-            for task in asyncio.Task.all_tasks(loop=self.loop):
-                task.cancel()
+        if self.loop is not None and self.loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(self._cancel_loop_tasks(), self.loop)
+            try:
+                future.result(timeout=self.TUNNEL_CLOSE_TIMEOUT)
+            except Exception as e:
+                RNS.log("Timed out or failed while cancelling I2P tasks: "+str(e), RNS.LOG_ERROR)
+            self.loop.call_soon_threadsafe(self.loop.stop)
 
-        time.sleep(0.2)
-
-        self.loop.stop()
+    async def _cancel_loop_tasks(self):
+        current_task = asyncio.current_task()
+        tasks = [
+            task for task in asyncio.all_tasks(self.loop)
+            if task is not current_task and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
     def get_free_port(self):
@@ -133,12 +182,41 @@ class I2PController:
 
 
     def stop_tunnel(self, i2ptunnel):
-        if hasattr(i2ptunnel, "stop") and callable(i2ptunnel.stop):
+        if i2ptunnel is None:
+            return
+
+        destinations = [
+            destination for destination, tunnel in self.i2plib_tunnels.items()
+            if tunnel is i2ptunnel
+        ]
+        if hasattr(i2ptunnel, "close") and callable(i2ptunnel.close):
+            future = asyncio.run_coroutine_threadsafe(i2ptunnel.close(), self.loop)
+            try:
+                future.result(timeout=self.TUNNEL_CLOSE_TIMEOUT)
+            except Exception as e:
+                RNS.log("Timed out or failed while closing I2P tunnel: "+str(e), RNS.LOG_ERROR)
+        elif hasattr(i2ptunnel, "stop") and callable(i2ptunnel.stop):
             i2ptunnel.stop()
+
+        for destination in destinations:
+            self.i2plib_tunnels.pop(destination, None)
+            self.client_tunnels.pop(destination, None)
+            self.server_tunnels.pop(destination, None)
+
+    def get_client_tunnel_error(self, i2p_destination):
+        return self.client_tunnel_errors.get(i2p_destination)
+
+    def get_client_tunnel_connected_seconds(self, i2p_destination):
+        online_since = self.client_tunnel_online_since.get(i2p_destination)
+        if online_since is None:
+            return 0
+        return max(0, time.monotonic() - online_since)
 
     def client_tunnel(self, owner, i2p_destination):
         self.client_tunnels[i2p_destination] = False
         self.i2plib_tunnels[i2p_destination] = None
+        self.client_tunnel_errors[i2p_destination] = None
+        self.client_tunnel_online_since[i2p_destination] = None
 
         while True:
             if not self.client_tunnels[i2p_destination]:
@@ -165,6 +243,7 @@ class I2PController:
                             RNS.log("Got status from I2P control process", RNS.LOG_EXTREME)
 
                             if tn.status["setup_failed"]:
+                                self.client_tunnel_errors[i2p_destination] = tn.status["exception"]
                                 self.stop_tunnel(tn)
                                 raise tn.status["exception"]
 
@@ -182,6 +261,7 @@ class I2PController:
                                             except Exception as e:
                                                 RNS.log("Error while closing socket for "+str(owner)+": "+str(e))
                                 self.client_tunnels[i2p_destination] = True
+                                self.client_tunnel_online_since[i2p_destination] = time.monotonic()
                                 owner.awaiting_i2p_tunnel = False
 
                                 RNS.log(str(owner)+" tunnel setup complete", RNS.LOG_VERBOSE)
@@ -196,6 +276,7 @@ class I2PController:
                     raise e
 
                 except Exception as e:
+                    self.client_tunnel_errors[i2p_destination] = e
                     RNS.log("Unexpected error type from I2P SAM: "+str(e), RNS.LOG_ERROR)
                     raise e
 
@@ -211,6 +292,7 @@ class I2PController:
                         return False
 
                     elif i2p_exception != None:
+                        self.client_tunnel_errors[i2p_destination] = i2p_exception
                         RNS.log("An error ocurred while setting up I2P tunnel to "+str(i2p_destination), RNS.LOG_ERROR)
 
                         if isinstance(i2p_exception, RNS.vendor.i2plib.exceptions.CantReachPeer):
@@ -425,6 +507,9 @@ class I2PInterfacePeer(Interface):
         self.last_write       = 0
         self.wd_reset         = False
         self.i2p_tunnel_state = I2PInterfacePeer.TUNNEL_STATE_INIT
+        self.i2p_retry_failures = 0
+        self.i2p_retry_delay = 0
+        self.i2p_circuit_open = False
 
         self.ifac_size = self.parent_interface.ifac_size
         self.ifac_netname = self.parent_interface.ifac_netname
@@ -475,7 +560,9 @@ class I2PInterfacePeer(Interface):
             self.awaiting_i2p_tunnel = True
 
             def tunnel_job():
+                retry_policy = I2PRetryPolicy()
                 while self.awaiting_i2p_tunnel:
+                    last_error = None
                     try:
                         self.bind_port   = self.parent_interface.i2p.get_free_port()
                         self.local_addr  = (self.bind_ip, self.bind_port)
@@ -485,12 +572,38 @@ class I2PInterfacePeer(Interface):
                         if not self.parent_interface.i2p.client_tunnel(self, target_i2p_dest):
                             RNS.log(str(self)+" I2P control process experienced an error, requesting new tunnel...", RNS.LOG_ERROR)
                             self.awaiting_i2p_tunnel = True
+                            last_error = self.parent_interface.i2p.get_client_tunnel_error(target_i2p_dest)
 
                     except Exception as e:
+                        last_error = e
                         RNS.log("Error while while configuring "+str(self)+": "+str(e), RNS.LOG_ERROR)
                         RNS.log("Check that I2P is installed and running, and that SAM is enabled. Retrying tunnel setup later.", RNS.LOG_ERROR)
 
-                    time.sleep(8)
+                    if self.awaiting_i2p_tunnel:
+                        permanent_errors = (
+                            RNS.vendor.i2plib.exceptions.InvalidKey,
+                            RNS.vendor.i2plib.exceptions.KeyNotFound,
+                        )
+                        connected_seconds = self.parent_interface.i2p.get_client_tunnel_connected_seconds(target_i2p_dest)
+                        delay, circuit_open = retry_policy.next_delay(
+                            permanent=isinstance(last_error, permanent_errors),
+                            connected_seconds=connected_seconds,
+                        )
+                        self.i2p_retry_failures = retry_policy.failures
+                        self.i2p_retry_delay = delay
+                        self.i2p_circuit_open = circuit_open
+                        if circuit_open:
+                            RNS.log(
+                                str(self)+" I2P setup circuit open after "+str(retry_policy.failures)+
+                                " failures; next half-open attempt in "+str(delay)+" seconds",
+                                RNS.LOG_ERROR,
+                            )
+                        else:
+                            RNS.log(
+                                str(self)+" will retry I2P tunnel setup in "+str(delay)+" seconds",
+                                RNS.LOG_WARNING,
+                            )
+                        time.sleep(delay)
 
             thread = threading.Thread(target=tunnel_job)
             thread.daemon = True

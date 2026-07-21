@@ -9,6 +9,16 @@ from .log import logger
 
 BUFFER_SIZE = 65536
 
+async def close_writer(writer):
+    if writer is None:
+        return
+    try:
+        writer.close()
+        if hasattr(writer, "wait_closed"):
+            await writer.wait_closed()
+    except (ConnectionError, RuntimeError):
+        pass
+
 async def proxy_data(reader, writer):
     """Proxy data from reader to writer"""
     try:
@@ -20,10 +30,7 @@ async def proxy_data(reader, writer):
     except Exception as e:
         logger.debug('proxy_data_task exception {}'.format(e))
     finally:
-        try:
-            writer.close()
-        except RuntimeError:
-            pass
+        await close_writer(writer)
         logger.debug('close connection')
 
 class I2PTunnel(object):
@@ -50,6 +57,14 @@ class I2PTunnel(object):
         self.options = options
         self.loop = loop
         self.sam_address = sam_address
+        self.session_writer = None
+        self._tasks = set()
+        self._closed = False
+
+    def _track_task(self, task):
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
 
     async def _pre_run(self):
         if not self.destination:
@@ -60,9 +75,38 @@ class I2PTunnel(object):
                 sam_address=self.sam_address, 
                 loop=self.loop, destination=self.destination)
 
+    async def close(self):
+        """Close all tunnel resources on their owning event loop."""
+        if self._closed:
+            return
+
+        current_task = asyncio.current_task()
+        tasks = [task for task in self._tasks if task is not current_task and not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        if self.session_writer is not None:
+            await close_writer(self.session_writer)
+            self.session_writer = None
+
+        self._closed = True
+
     def stop(self):
-        """Stop the tunnel"""
-        self.session_writer.close()
+        """Schedule a non-blocking, event-loop-safe tunnel close."""
+        if self.loop is not None and self.loop.is_running():
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+
+            if running_loop is self.loop:
+                self.loop.create_task(self.close())
+            else:
+                asyncio.run_coroutine_threadsafe(self.close(), self.loop)
+        elif self.session_writer is not None:
+            self.session_writer.close()
 
 class ClientTunnel(I2PTunnel):
     """Client tunnel, a subclass of tunnel.I2PTunnel
@@ -88,22 +132,26 @@ class ClientTunnel(I2PTunnel):
         self.status = { "setup_ran": False, "setup_failed": False, "exception": None, "connect_tasks": [] }
         async def handle_client(client_reader, client_writer):
             """Handle local client connection"""
+            handler_task = asyncio.current_task()
+            if handler_task is not None:
+                self._track_task(handler_task)
             try:
-                sc_task = aiosam.stream_connect(
+                sc_task = self._track_task(asyncio.ensure_future(aiosam.stream_connect(
                         self.session_name, self.remote_destination, 
-                        sam_address=self.sam_address, loop=self.loop)
+                        sam_address=self.sam_address, loop=self.loop), loop=self.loop))
                 self.status["connect_tasks"].append(sc_task)
                 
                 remote_reader, remote_writer = await sc_task
-                asyncio.ensure_future(proxy_data(remote_reader, client_writer), 
-                                      loop=self.loop)
-                asyncio.ensure_future(proxy_data(client_reader, remote_writer),
-                                      loop=self.loop)
+                self._track_task(asyncio.ensure_future(proxy_data(remote_reader, client_writer),
+                                                       loop=self.loop))
+                self._track_task(asyncio.ensure_future(proxy_data(client_reader, remote_writer),
+                                                       loop=self.loop))
 
             except Exception as e:
                 self.status["setup_ran"] = True
                 self.status["setup_failed"] = True
                 self.status["exception"] = e
+                await close_writer(client_writer)
 
 
         try:
@@ -115,9 +163,17 @@ class ClientTunnel(I2PTunnel):
             self.status["setup_failed"] = True
             self.status["exception"] = e
 
-    def stop(self):
-        super().stop()
-        self.server.close()
+    async def close(self):
+        if self._closed:
+            return
+        if hasattr(self, "server"):
+            self.server.close()
+            if hasattr(self.server, "wait_closed"):
+                try:
+                    await self.server.wait_closed()
+                except (ConnectionError, RuntimeError):
+                    pass
+        await super().close()
 
 class ServerTunnel(I2PTunnel):
     """Server tunnel, a subclass of tunnel.I2PTunnel
@@ -137,6 +193,9 @@ class ServerTunnel(I2PTunnel):
 
         self.status = { "setup_ran": False, "setup_failed": False, "exception": None, "connect_tasks": [] }
         async def handle_client(incoming, client_reader, client_writer):
+            handler_task = asyncio.current_task()
+            if handler_task is not None:
+                self._track_task(handler_task)
             try:
                 # data and dest may come in one chunk
                 dest, data = incoming.split(b"\n", 1) 
@@ -150,22 +209,22 @@ class ServerTunnel(I2PTunnel):
                 data = None
 
             try:
-                sc_task = asyncio.wait_for(
+                sc_task = self._track_task(asyncio.ensure_future(asyncio.wait_for(
                         asyncio.open_connection(
                            host=self.local_address[0], 
                            port=self.local_address[1]),
-                        timeout=5)
+                        timeout=5), loop=self.loop))
                 self.status["connect_tasks"].append(sc_task)
 
                 remote_reader, remote_writer = await sc_task
                 if data: remote_writer.write(data)
-                asyncio.ensure_future(proxy_data(remote_reader, client_writer),
-                                      loop=self.loop)
-                asyncio.ensure_future(proxy_data(client_reader, remote_writer),
-                                      loop=self.loop)
+                self._track_task(asyncio.ensure_future(proxy_data(remote_reader, client_writer),
+                                                       loop=self.loop))
+                self._track_task(asyncio.ensure_future(proxy_data(client_reader, remote_writer),
+                                                       loop=self.loop))
 
-            except ConnectionRefusedError:
-                client_writer.close()
+            except ConnectionRefusedError as e:
+                await close_writer(client_writer)
                 self.status["exception"] = e
                 self.status["setup_failed"] = True
 
@@ -181,12 +240,15 @@ class ServerTunnel(I2PTunnel):
             except asyncio.CancelledError:
                 pass
 
-        self.server_loop = asyncio.ensure_future(server_loop(), loop=self.loop)
+        self.server_loop = self._track_task(asyncio.ensure_future(server_loop(), loop=self.loop))
         self.status["setup_ran"] = True
 
-    def stop(self):
-        super().stop()
-        self.server_loop.cancel()
+    async def close(self):
+        if self._closed:
+            return
+        if hasattr(self, "server_loop"):
+            self.server_loop.cancel()
+        await super().close()
 
 
 if __name__ == '__main__':
